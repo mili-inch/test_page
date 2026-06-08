@@ -101,13 +101,13 @@
       デバイス側が改行終端を必要とする場合は "\n" に変更。
       指定がなければ空文字のまま。
     */
-    const PROTOCOL_SUFFIX = "";
+    const PROTOCOL_SUFFIX = "\n";
 
     /*
       trueにすると全デバイス表示になる。
       通常はfalseで、指定serviceをadvertiseしているデバイスだけを表示する。
     */
-    const USE_ACCEPT_ALL_DEVICES = false;
+    const USE_ACCEPT_ALL_DEVICES = true;
 
     const WRITE_INTERVAL_MS = 100;
     const STORAGE_KEY = "adaptive-rotation-pattern-v1";
