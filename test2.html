@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BLE Rotation Pattern Controller</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 860px;
+      margin: 24px auto;
+      padding: 0 16px;
+      line-height: 1.6;
+    }
+    button, input {
+      font: inherit;
+    }
+    button {
+      margin: 4px;
+      padding: 8px 12px;
+    }
+    .row {
+      margin: 12px 0;
+    }
+    label {
+      display: block;
+      margin: 10px 0;
+    }
+    input[type="range"] {
+      width: 320px;
+      max-width: 100%;
+    }
+    #log {
+      background: #111;
+      color: #eee;
+      padding: 12px;
+      min-height: 160px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .danger {
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <h1>BLE Rotation Pattern Controller</h1>
+
+  <div class="row">
+    <button id="connectBtn">接続</button>
+    <button id="startBtn" disabled>開始</button>
+    <button id="stopBtn" disabled class="danger">停止</button>
+    <span id="status">未接続</span>
+  </div>
+
+  <div class="row">
+    <label>
+      上限強度:
+      <input id="intensity" type="range" min="0.10" max="1.00" step="0.01" value="0.55">
+      <output id="intensityOut">0.55</output>
+    </label>
+
+    <label>
+      変化のなめらかさ / slew rate:
+      <input id="slew" type="range" min="0.20" max="3.00" step="0.05" value="0.90">
+      <output id="slewOut">0.90</output>
+    </label>
+
+    <label>
+      最大連続実行時間:
+      <input id="maxMinutes" type="range" min="1" max="20" step="1" value="10">
+      <output id="maxMinutesOut">10分</output>
+    </label>
+  </div>
+
+  <div class="row">
+    <div>現在出力: <span id="outputView">0.000 → 0</span></div>
+    <div>現在パターン: <span id="modeView">なし</span></div>
+  </div>
+
+  <div class="row">
+    <button data-feedback="good">良い</button>
+    <button data-feedback="ok">普通</button>
+    <button data-feedback="tooWeak">弱い</button>
+    <button data-feedback="tooStrong">強い / 不快</button>
+    <button data-feedback="boring">単調</button>
+    <button id="resetLearningBtn">学習リセット</button>
+  </div>
+
+  <pre id="log"></pre>
+
+  <script type="module">
+    /*
+      TODO: 実機のGATT UUIDに置き換える。
+      service自体には直接書けないため、service配下のwrite可能なcharacteristic UUIDが必要。
+    */
+    const SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
+    const CHARACTERISTIC_UUID = "12345678-1234-5678-1234-56789abcdef1";
+
+    /*
+      デバイス側が改行終端を必要とする場合は "\n" に変更。
+      指定がなければ空文字のまま。
+    */
+    const PROTOCOL_SUFFIX = "";
+
+    /*
+      trueにすると全デバイス表示になる。
+      通常はfalseで、指定serviceをadvertiseしているデバイスだけを表示する。
+    */
+    const USE_ACCEPT_ALL_DEVICES = false;
+
+    const WRITE_INTERVAL_MS = 100;
+    const STORAGE_KEY = "adaptive-rotation-pattern-v1";
+
+    const MODES = [
+      { id: "sine", label: "連続反転" },
+      { id: "pulse", label: "断続パルス" },
+      { id: "switchback", label: "短周期反転" },
+      { id: "crescendo", label: "漸増" },
+      { id: "drift", label: "制御ランダム" },
+      { id: "pauseReverse", label: "停止混合反転" }
+    ];
+
+    const $ = (id) => document.getElementById(id);
+    const connectBtn = $("connectBtn");
+    const startBtn = $("startBtn");
+    const stopBtn = $("stopBtn");
+    const statusEl = $("status");
+    const logEl = $("log");
+    const intensityEl = $("intensity");
+    const intensityOut = $("intensityOut");
+    const slewEl = $("slew");
+    const slewOut = $("slewOut");
+    const maxMinutesEl = $("maxMinutes");
+    const maxMinutesOut = $("maxMinutesOut");
+    const outputView = $("outputView");
+    const modeView = $("modeView");
+
+    let device = null;
+    let server = null;
+    let writeChar = null;
+
+    let running = false;
+    let timerId = 0;
+    let sessionStartMs = 0;
+    let lastTickMs = 0;
+    let segmentStartMs = 0;
+    let currentSegment = null;
+    let previousMode = null;
+
+    let lastOutput = 0;
+    let lastProtocolInt = null;
+
+    let pendingInt = null;
+    let pumpPromise = null;
+
+    const encoder = new TextEncoder();
+
+    let stats = loadStats();
+
+    function log(message) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent = `[${t}] ${message}\n` + logEl.textContent;
+    }
+
+    function clamp(x, min, max) {
+      return Math.min(max, Math.max(min, x));
+    }
+
+    function rand(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function smooth01(x) {
+      x = clamp(x, 0, 1);
+      return x * x * (3 - 2 * x);
+    }
+
+    function protocolIntFromOutput(x) {
+      return Math.round(clamp(x, -1, 1) * 255);
+    }
+
+    function setIntensity(v) {
+      intensityEl.value = String(clamp(v, 0.10, 1.00).toFixed(2));
+      intensityOut.value = Number(intensityEl.value).toFixed(2);
+    }
+
+    function updateControls() {
+      intensityOut.value = Number(intensityEl.value).toFixed(2);
+      slewOut.value = Number(slewEl.value).toFixed(2);
+      maxMinutesOut.value = `${Number(maxMinutesEl.value)}分`;
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function loadStats() {
+      const fresh = Object.fromEntries(
+        MODES.map((m) => [m.id, { n: 0, sum: 0 }])
+      );
+
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return fresh;
+
+        const parsed = JSON.parse(raw);
+        for (const m of MODES) {
+          if (parsed[m.id]) {
+            fresh[m.id].n = Number(parsed[m.id].n) || 0;
+            fresh[m.id].sum = Number(parsed[m.id].sum) || 0;
+          }
+        }
+      } catch {
+        return fresh;
+      }
+
+      return fresh;
+    }
+
+    function saveStats() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(stats));
+    }
+
+    function resetLearning() {
+      stats = Object.fromEntries(MODES.map((m) => [m.id, { n: 0, sum: 0 }]));
+      saveStats();
+      log("学習データをリセット");
+    }
+
+    function chooseMode() {
+      const total = Object.values(stats).reduce((a, s) => a + s.n, 0) + 1;
+
+      let bestId = MODES[0].id;
+      let bestScore = -Infinity;
+
+      for (const m of MODES) {
+        const s = stats[m.id];
+
+        /*
+          報酬の事前値を0.55に置く。
+          未評価パターンも試し、評価が高いものを徐々に優先する。
+        */
+        const mean = (s.sum + 0.55) / (s.n + 1);
+        const explore = 0.30 * Math.sqrt(Math.log(total + 1) / (s.n + 1));
+        const repeatPenalty = m.id === previousMode ? 0.12 : 0;
+        const jitter = rand(-0.025, 0.025);
+
+        const score = mean + explore - repeatPenalty + jitter;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestId = m.id;
+        }
+      }
+
+      return bestId;
+    }
+
+    function createSegment(nowMs) {
+      const mode = chooseMode();
+      previousMode = mode;
+
+      currentSegment = {
+        mode,
+        duration: rand(5.0, 14.0),
+        dir: Math.random() < 0.5 ? -1 : 1,
+        amp: rand(0.45, 1.00),
+        freq: rand(0.06, 0.22),
+        phase: rand(0, Math.PI * 2),
+        cycle: rand(0.80, 2.40),
+        duty: rand(0.34, 0.72),
+        beat: rand(1.00, 3.20),
+        noise: 0,
+        noiseTarget: 0,
+        lastNoiseAt: -Infinity
+      };
+
+      segmentStartMs = nowMs;
+
+      const label = MODES.find((m) => m.id === mode)?.label ?? mode;
+      modeView.textContent = label;
+      log(`新規セグメント: ${label}, ${currentSegment.duration.toFixed(1)}秒`);
+    }
+
+    function valueForSegment(seg, tSec, sessionElapsedMs) {
+      const cap = Number(intensityEl.value);
+
+      /*
+        ウォームアップ。
+        開始直後から上限値を使わず、約2分かけて上限へ近づける。
+      */
+      const warm = clamp(0.18 + 0.82 * (sessionElapsedMs / 120000), 0.18, 1.0);
+      const amp = cap * warm * seg.amp;
+
+      switch (seg.mode) {
+        case "sine": {
+          return amp * Math.sin(2 * Math.PI * seg.freq * tSec + seg.phase);
+        }
+
+        case "pulse": {
+          const f = (tSec / seg.cycle) % 1;
+          if (f > seg.duty) return 0;
+
+          const local = f / seg.duty;
+          const shaped = 0.25 + 0.75 * Math.sin(Math.PI * local);
+
+          /*
+            たまに逆方向を混ぜて慣れを避ける。
+          */
+          const cycleIndex = Math.floor(tSec / seg.cycle);
+          const reverse = cycleIndex % 6 === 5 ? -1 : 1;
+
+          return seg.dir * reverse * amp * shaped;
+        }
+
+        case "switchback": {
+          const beatIndex = Math.floor(tSec / seg.beat);
+          const f = (tSec / seg.beat) % 1;
+
+          /*
+            反転直後に短い停止を入れ、急な方向転換を緩和する。
+          */
+          if (f < 0.10) return 0;
+
+          const sign = beatIndex % 2 === 0 ? seg.dir : -seg.dir;
+          const rise = smooth01((f - 0.10) / 0.90);
+
+          return sign * amp * (0.35 + 0.65 * rise);
+        }
+
+        case "crescendo": {
+          const p = tSec / seg.duration;
+          const ramp = smooth01(p);
+          const wobble = clamp(
+            0.72 + 0.28 * Math.sin(2 * Math.PI * seg.freq * 2.5 * tSec + seg.phase),
+            0.25,
+            1.0
+          );
+
+          /*
+            終盤だけ短い反転を混ぜる。
+          */
+          const sign =
+            p > 0.78 && Math.floor(tSec * 2.0) % 2 === 0
+              ? -seg.dir
+              : seg.dir;
+
+          return sign * amp * ramp * wobble;
+        }
+
+        case "drift": {
+          /*
+            低域通過させたランダム。
+            完全ランダムではなく、滑らかに変化させる。
+          */
+          if (tSec - seg.lastNoiseAt > 0.25) {
+            seg.noiseTarget = rand(-1, 1);
+            seg.lastNoiseAt = tSec;
+          }
+
+          seg.noise += (seg.noiseTarget - seg.noise) * 0.18;
+
+          if (Math.abs(seg.noise) < 0.18) return 0;
+          return amp * seg.noise;
+        }
+
+        case "pauseReverse": {
+          const f = (tSec / seg.cycle) % 1;
+          const cycleIndex = Math.floor(tSec / seg.cycle);
+
+          if (f < 0.18) return 0;
+
+          const sign = cycleIndex % 4 === 3 ? -seg.dir : seg.dir;
+          const drive = 0.20 + 0.80 * smooth01((f - 0.18) / 0.82);
+
+          return sign * amp * drive;
+        }
+
+        default:
+          return 0;
+      }
+    }
+
+    async function connect() {
+      try {
+        if (!window.isSecureContext) {
+          throw new Error("HTTPSまたはlocalhostで開いてください。");
+        }
+
+        if (!navigator.bluetooth) {
+          throw new Error("このブラウザはWeb Bluetoothに対応していません。Chromium系ブラウザで確認してください。");
+        }
+
+        setStatus("デバイス選択中...");
+
+        const options = USE_ACCEPT_ALL_DEVICES
+          ? {
+              acceptAllDevices: true,
+              optionalServices: [SERVICE_UUID]
+            }
+          : {
+              filters: [{ services: [SERVICE_UUID] }],
+              optionalServices: [SERVICE_UUID]
+            };
+
+        device = await navigator.bluetooth.requestDevice(options);
+        device.addEventListener("gattserverdisconnected", handleDisconnected);
+
+        setStatus("接続中...");
+        server = await device.gatt.connect();
+
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        writeChar = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+        startBtn.disabled = false;
+        stopBtn.disabled = false;
+
+        setStatus(`接続済み: ${device.name || device.id}`);
+        log("BLE接続完了");
+      } catch (err) {
+        setStatus("接続失敗");
+        log(`接続エラー: ${err.message || err}`);
+      }
+    }
+
+    async function writeOneProtocolInt(n) {
+      if (!writeChar) return;
+
+      const text = `${n}${PROTOCOL_SUFFIX}`;
+      const data = encoder.encode(text);
+
+      if (writeChar.properties.writeWithoutResponse && writeChar.writeValueWithoutResponse) {
+        await writeChar.writeValueWithoutResponse(data);
+        return;
+      }
+
+      if (writeChar.properties.write && writeChar.writeValueWithResponse) {
+        await writeChar.writeValueWithResponse(data);
+        return;
+      }
+
+      /*
+        古い環境向けの後方互換フォールバック。
+        可能なら上の2つを使う。
+      */
+      if (writeChar.writeValue) {
+        await writeChar.writeValue(data);
+        return;
+      }
+
+      throw new Error("このcharacteristicはwriteに対応していません。");
+    }
+
+    function enqueueProtocolInt(n) {
+      pendingInt = clamp(Math.round(n), -255, 255);
+
+      if (!pumpPromise) {
+        pumpPromise = pumpWrites().catch((err) => {
+          log(`書き込みエラー: ${err.message || err}`);
+        });
+      }
+
+      return pumpPromise;
+    }
+
+    async function pumpWrites() {
+      try {
+        while (pendingInt !== null) {
+          const n = pendingInt;
+          pendingInt = null;
+          await writeOneProtocolInt(n);
+        }
+      } finally {
+        pumpPromise = null;
+
+        /*
+          finally中に新しい値が来た場合の取りこぼし防止。
+        */
+        if (pendingInt !== null) {
+          enqueueProtocolInt(pendingInt);
+        }
+      }
+    }
+
+    function setOutput(x, force = false) {
+      const safeX = clamp(x, -1, 1);
+      const protocolInt = protocolIntFromOutput(safeX);
+
+      outputView.textContent = `${safeX.toFixed(3)} → ${protocolInt}`;
+
+      if (!force && protocolInt === lastProtocolInt) {
+        return Promise.resolve();
+      }
+
+      lastProtocolInt = protocolInt;
+      return enqueueProtocolInt(protocolInt);
+    }
+
+    function tick() {
+      if (!running) return;
+
+      const now = performance.now();
+      const sessionElapsedMs = now - sessionStartMs;
+      const maxMs = Number(maxMinutesEl.value) * 60 * 1000;
+
+      if (sessionElapsedMs >= maxMs) {
+        void stop("最大連続実行時間に到達");
+        return;
+      }
+
+      if (!currentSegment || (now - segmentStartMs) / 1000 >= currentSegment.duration) {
+        createSegment(now);
+      }
+
+      const dtSec = clamp((now - lastTickMs) / 1000, 0.001, 0.25);
+      lastTickMs = now;
+
+      const tSec = (now - segmentStartMs) / 1000;
+      const target = valueForSegment(currentSegment, tSec, sessionElapsedMs);
+
+      /*
+        slew limit。
+        急な出力変化を抑える。
+      */
+      const maxDelta = Number(slewEl.value) * dtSec;
+      lastOutput += clamp(target - lastOutput, -maxDelta, maxDelta);
+      lastOutput = clamp(lastOutput, -1, 1);
+
+      void setOutput(lastOutput);
+    }
+
+    function start() {
+      if (!writeChar) {
+        log("未接続");
+        return;
+      }
+
+      if (running) return;
+
+      running = true;
+      sessionStartMs = performance.now();
+      lastTickMs = sessionStartMs;
+      segmentStartMs = sessionStartMs;
+      currentSegment = null;
+      lastOutput = 0;
+
+      timerId = window.setInterval(tick, WRITE_INTERVAL_MS);
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      log("開始");
+    }
+
+    async function stop(reason = "停止") {
+      running = false;
+
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = 0;
+      }
+
+      currentSegment = null;
+      modeView.textContent = "なし";
+      lastOutput = 0;
+
+      await setOutput(0, true);
+
+      startBtn.disabled = !writeChar;
+      stopBtn.disabled = !writeChar;
+
+      log(reason);
+    }
+
+    async function emergencyStop(reason) {
+      await stop(reason || "緊急停止");
+    }
+
+    function handleDisconnected() {
+      running = false;
+
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = 0;
+      }
+
+      writeChar = null;
+      server = null;
+      currentSegment = null;
+
+      startBtn.disabled = true;
+      stopBtn.disabled = true;
+
+      setStatus("切断");
+      log("BLE切断。デバイス側にも通信タイムアウト時停止のwatchdogを実装してください。");
+    }
+
+    function applyFeedback(kind) {
+      if (!currentSegment) {
+        log("評価対象のセグメントなし");
+        return;
+      }
+
+      const rewardMap = {
+        good: 1.00,
+        ok: 0.65,
+        tooWeak: 0.45,
+        tooStrong: 0.10,
+        boring: 0.20
+      };
+
+      const reward = rewardMap[kind] ?? 0.5;
+      const s = stats[currentSegment.mode];
+
+      s.n += 1;
+      s.sum += reward;
+      saveStats();
+
+      if (kind === "tooStrong") {
+        setIntensity(Number(intensityEl.value) * 0.82);
+        currentSegment.amp *= 0.40;
+        lastOutput *= 0.40;
+        void setOutput(lastOutput, true);
+        log("評価: 強い / 不快。強度を下げました。");
+        return;
+      }
+
+      if (kind === "tooWeak") {
+        setIntensity(Number(intensityEl.value) * 1.08);
+        currentSegment.duration = Math.min(
+          currentSegment.duration,
+          (performance.now() - segmentStartMs) / 1000 + 2
+        );
+        log("評価: 弱い。強度を少し上げ、次セグメントを早めます。");
+        return;
+      }
+
+      if (kind === "boring") {
+        currentSegment.duration = 0;
+        log("評価: 単調。次セグメントへ切り替えます。");
+        return;
+      }
+
+      const label = MODES.find((m) => m.id === currentSegment.mode)?.label ?? currentSegment.mode;
+      log(`評価: ${kind} / ${label} / reward=${reward.toFixed(2)}`);
+    }
+
+    connectBtn.addEventListener("click", connect);
+    startBtn.addEventListener("click", start);
+    stopBtn.addEventListener("click", () => void emergencyStop("手動停止"));
+    $("resetLearningBtn").addEventListener("click", resetLearning);
+
+    document.querySelectorAll("[data-feedback]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        applyFeedback(btn.dataset.feedback);
+      });
+    });
+
+    intensityEl.addEventListener("input", updateControls);
+    slewEl.addEventListener("input", updateControls);
+    maxMinutesEl.addEventListener("input", updateControls);
+
+    /*
+      安全側停止。
+      タブが隠れた、ページを閉じる、スペースキー押下で停止。
+    */
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && running) {
+        void emergencyStop("タブ非表示のため停止");
+      }
+    });
+
+    window.addEventListener("pagehide", () => {
+      if (writeChar) {
+        void setOutput(0, true);
+      }
+    });
+
+    window.addEventListener("keydown", (ev) => {
+      if (ev.code === "Space") {
+        ev.preventDefault();
+        void emergencyStop("スペースキー停止");
+      }
+    });
+
+    updateControls();
+    log("準備完了。UUIDを実機に合わせてから接続してください。");
+  </script>
+</body>
+</html>
