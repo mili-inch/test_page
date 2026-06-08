@@ -1,0 +1,1218 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BLE Adaptive Rotation Pattern Controller</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 920px;
+      margin: 24px auto;
+      padding: 0 16px;
+      line-height: 1.6;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      margin: 4px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .row {
+      margin: 12px 0;
+    }
+
+    label {
+      display: block;
+      margin: 10px 0;
+    }
+
+    input[type="range"] {
+      width: 360px;
+      max-width: 100%;
+      vertical-align: middle;
+    }
+
+    #log {
+      background: #111;
+      color: #eee;
+      padding: 12px;
+      min-height: 180px;
+      max-height: 420px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .danger {
+      font-weight: 700;
+    }
+
+    .statusBox {
+      padding: 10px 12px;
+      background: #f3f3f3;
+      border-radius: 6px;
+    }
+
+    .small {
+      font-size: 0.92rem;
+      color: #555;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>BLE Adaptive Rotation Pattern Controller</h1>
+
+  <div class="statusBox">
+    <div>状態: <span id="status">未接続</span></div>
+    <div>現在出力: <span id="outputView">0.000 → 0</span></div>
+    <div>現在パターン: <span id="modeView">なし</span></div>
+  </div>
+
+  <div class="row">
+    <button id="connectBtn">接続</button>
+    <button id="startBtn" disabled>開始</button>
+    <button id="stopBtn" disabled class="danger">停止</button>
+  </div>
+
+  <div class="row">
+    <label>
+      上限強度:
+      <input id="intensity" type="range" min="0.10" max="1.00" step="0.01" value="0.55">
+      <output id="intensityOut">0.55</output>
+    </label>
+
+    <label>
+      最低強度:
+      <input id="minIntensity" type="range" min="0.00" max="1.00" step="0.01" value="0.08">
+      <output id="minIntensityOut">0.08</output>
+    </label>
+
+    <label>
+      変化のなめらかさ / slew rate:
+      <input id="slew" type="range" min="0.20" max="3.00" step="0.05" value="0.90">
+      <output id="slewOut">0.90</output>
+    </label>
+
+    <label>
+      最大連続実行時間:
+      <input id="maxMinutes" type="range" min="1" max="20" step="1" value="10">
+      <output id="maxMinutesOut">10分</output>
+    </label>
+
+    <label>
+      変化の意外性:
+      <input id="novelty" type="range" min="0.20" max="0.75" step="0.01" value="0.48">
+      <output id="noveltyOut">0.48</output>
+    </label>
+
+    <label>
+      フレーズ長:
+      <input id="phraseLength" type="range" min="0" max="2" step="1" value="1">
+      <output id="phraseLengthOut">標準</output>
+    </label>
+  </div>
+
+  <div class="row">
+    <button data-feedback="good">良い</button>
+    <button data-feedback="ok">普通</button>
+    <button data-feedback="tooWeak">弱い</button>
+    <button data-feedback="tooStrong">強い / 不快</button>
+    <button data-feedback="boring">単調</button>
+    <button id="resetLearningBtn">学習リセット</button>
+  </div>
+
+  <p class="small">
+    スペースキー、タブ非表示、手動停止で 0 を送信します。デバイス側にも通信途絶時に停止する watchdog を実装してください。
+  </p>
+
+  <pre id="log"></pre>
+
+  <script type="module">
+    /*
+      実機のGATT UUIDに置き換える。
+      BLEではservice自体へ直接書き込むのではなく、
+      service配下のwrite可能なcharacteristicへ書き込む。
+    */
+    const SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
+    const CHARACTERISTIC_UUID = "12345678-1234-5678-1234-56789abcdef1";
+
+    /*
+      デバイス側が改行終端を必要とする場合は "\n" に変更。
+      指定がなければ空文字のまま。
+    */
+    const PROTOCOL_SUFFIX = "";
+
+    /*
+      指定どおり true。
+      すべてのBLEデバイスを表示し、optionalServicesで対象serviceを取得する。
+    */
+    const ACCEPT_ALL_DEVICES = true;
+
+    const WRITE_INTERVAL_MS = 100;
+    const STORAGE_KEY = "adaptive-rotation-phrase-pattern-v3";
+    const RECENT_LIMIT = 22;
+
+    const MOTIFS = [
+      { id: "breath", label: "なめらか往復", minDur: 3.2, maxDur: 6.0 },
+      { id: "stutter", label: "断続パルス", minDur: 2.0, maxDur: 4.8 },
+      { id: "ratchet", label: "階段状加速", minDur: 2.8, maxDur: 5.5 },
+      { id: "reverseSnap", label: "停止入り反転", minDur: 2.2, maxDur: 5.0 },
+      { id: "flutter", label: "細かい揺らぎ", minDur: 1.8, maxDur: 4.0 },
+      { id: "drift", label: "ランダム漂流", minDur: 3.0, maxDur: 6.2 },
+      { id: "holdDrop", label: "保持と脱力", minDur: 2.5, maxDur: 5.2 },
+      { id: "triplet", label: "三連アクセント", minDur: 1.8, maxDur: 4.0 },
+      { id: "suspend", label: "低刺激の間", minDur: 1.0, maxDur: 2.4 },
+      { id: "surge", label: "急上昇と減衰", minDur: 2.0, maxDur: 4.6 },
+      { id: "hesitate", label: "迷い反転", minDur: 2.4, maxDur: 5.4 },
+      { id: "syncopate", label: "変拍アクセント", minDur: 2.0, maxDur: 4.8 }
+    ];
+
+    const MOTIFS_BY_ID = Object.fromEntries(MOTIFS.map((m) => [m.id, m]));
+
+    const POSITION_BIAS = {
+      breath:      [ 0.18,  0.04, -0.10],
+      stutter:     [ 0.10,  0.10,  0.00],
+      ratchet:     [ 0.12,  0.12,  0.04],
+      reverseSnap: [-0.06,  0.10,  0.20],
+      flutter:     [-0.10,  0.08,  0.18],
+      drift:       [ 0.16,  0.04, -0.04],
+      holdDrop:    [-0.02,  0.12,  0.14],
+      triplet:     [-0.04,  0.10,  0.12],
+      suspend:     [-0.02,  0.02, -0.06],
+      surge:       [-0.02,  0.10,  0.18],
+      hesitate:    [ 0.08,  0.12,  0.02],
+      syncopate:   [-0.04,  0.14,  0.16]
+    };
+
+    const TRANSITION_BONUS = {
+      breath:      { ratchet: 0.15, stutter: 0.12, holdDrop: 0.08, hesitate: 0.12 },
+      stutter:     { suspend: 0.10, reverseSnap: 0.15, drift: 0.08, syncopate: 0.12 },
+      ratchet:     { flutter: 0.15, holdDrop: 0.14, reverseSnap: 0.10, surge: 0.12 },
+      reverseSnap: { breath: 0.12, triplet: 0.10, drift: 0.08, hesitate: 0.10 },
+      flutter:     { suspend: 0.16, holdDrop: 0.12, reverseSnap: 0.10, syncopate: 0.12 },
+      drift:       { stutter: 0.12, ratchet: 0.10, breath: 0.08, surge: 0.08 },
+      holdDrop:    { triplet: 0.13, suspend: 0.10, reverseSnap: 0.10, surge: 0.10 },
+      triplet:     { breath: 0.12, drift: 0.10, flutter: 0.08, syncopate: 0.10 },
+      suspend:     { reverseSnap: 0.14, ratchet: 0.12, breath: 0.10, surge: 0.12 },
+      surge:       { suspend: 0.12, flutter: 0.14, holdDrop: 0.12, breath: 0.08 },
+      hesitate:    { reverseSnap: 0.12, ratchet: 0.10, triplet: 0.10, drift: 0.08 },
+      syncopate:   { breath: 0.10, suspend: 0.12, reverseSnap: 0.12, flutter: 0.10 }
+    };
+
+    const ARC_LABEL = {
+      build: "漸増フレーズ",
+      wave: "山型フレーズ",
+      contrast: "緩急フレーズ",
+      scatter: "変則フレーズ",
+      broken: "崩しフレーズ"
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    const connectBtn = $("connectBtn");
+    const startBtn = $("startBtn");
+    const stopBtn = $("stopBtn");
+    const statusEl = $("status");
+    const logEl = $("log");
+    const intensityEl = $("intensity");
+    const intensityOut = $("intensityOut");
+    const minIntensityEl = $("minIntensity");
+    const minIntensityOut = $("minIntensityOut");
+    const slewEl = $("slew");
+    const slewOut = $("slewOut");
+    const maxMinutesEl = $("maxMinutes");
+    const maxMinutesOut = $("maxMinutesOut");
+    const noveltyEl = $("novelty");
+    const noveltyOut = $("noveltyOut");
+    const phraseLengthEl = $("phraseLength");
+    const phraseLengthOut = $("phraseLengthOut");
+    const outputView = $("outputView");
+    const modeView = $("modeView");
+
+    let device = null;
+    let server = null;
+    let writeChar = null;
+
+    let running = false;
+    let timerId = 0;
+    let sessionStartMs = 0;
+    let lastTickMs = 0;
+    let segmentStartMs = 0;
+    let currentSegment = null;
+
+    let lastOutput = 0;
+    let lastProtocolInt = null;
+
+    let pendingInt = null;
+    let pumpPromise = null;
+
+    let recentMotifs = [];
+
+    const encoder = new TextEncoder();
+    let stats = loadStats();
+
+    function log(message) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent = `[${t}] ${message}\n` + logEl.textContent;
+    }
+
+    function clamp(x, min, max) {
+      return Math.min(max, Math.max(min, x));
+    }
+
+    function rand(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function smooth01(x) {
+      x = clamp(x, 0, 1);
+      return x * x * (3 - 2 * x);
+    }
+
+    function protocolIntFromOutput(x) {
+      return Math.round(clamp(x, -1, 1) * 255);
+    }
+
+    function freshStats() {
+      return Object.fromEntries(MOTIFS.map((m) => [m.id, { n: 0, sum: 0 }]));
+    }
+
+    function loadStats() {
+      const fresh = freshStats();
+
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return fresh;
+
+        const parsed = JSON.parse(raw);
+
+        for (const m of MOTIFS) {
+          if (parsed[m.id]) {
+            fresh[m.id].n = Number(parsed[m.id].n) || 0;
+            fresh[m.id].sum = Number(parsed[m.id].sum) || 0;
+          }
+        }
+      } catch {
+        return fresh;
+      }
+
+      return fresh;
+    }
+
+    function saveStats() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(stats));
+    }
+
+    function resetLearning() {
+      stats = freshStats();
+      recentMotifs = [];
+      saveStats();
+      log("学習データと直近パターン履歴をリセット");
+    }
+
+    function getIntensityBounds() {
+      const maxDrive = clamp(Number(intensityEl.value) || 0.55, 0.10, 1.00);
+      const minDrive = clamp(Number(minIntensityEl.value) || 0, 0.00, maxDrive);
+
+      return {
+        minDrive,
+        maxDrive
+      };
+    }
+
+    function setIntensity(v) {
+      intensityEl.value = String(clamp(v, 0.10, 1.00).toFixed(2));
+      updateControls();
+    }
+
+    function setMinIntensity(v) {
+      const maxDrive = clamp(Number(intensityEl.value) || 0.55, 0.10, 1.00);
+      minIntensityEl.value = String(clamp(v, 0.00, maxDrive).toFixed(2));
+      updateControls();
+    }
+
+    function updateControls() {
+      const maxDrive = clamp(Number(intensityEl.value) || 0.55, 0.10, 1.00);
+      let minDrive = clamp(Number(minIntensityEl.value) || 0, 0.00, maxDrive);
+
+      if (minDrive > maxDrive) {
+        minDrive = maxDrive;
+        minIntensityEl.value = String(minDrive.toFixed(2));
+      }
+
+      minIntensityEl.max = String(maxDrive.toFixed(2));
+
+      intensityOut.value = maxDrive.toFixed(2);
+      minIntensityOut.value = minDrive.toFixed(2);
+      slewOut.value = Number(slewEl.value).toFixed(2);
+      maxMinutesOut.value = `${Number(maxMinutesEl.value)}分`;
+      noveltyOut.value = Number(noveltyEl.value).toFixed(2);
+
+      const phraseLabels = ["短め", "標準", "長め"];
+      phraseLengthOut.value = phraseLabels[Number(phraseLengthEl.value)] ?? "標準";
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function sampleSoftmax(scored, temperature = 0.48) {
+      const safeTemperature = clamp(Number(temperature) || 0.48, 0.05, 1.50);
+      const maxScore = Math.max(...scored.map((x) => x.score));
+
+      const weighted = scored.map((x) => ({
+        id: x.id,
+        weight: Math.exp((x.score - maxScore) / safeTemperature)
+      }));
+
+      const total = weighted.reduce((a, x) => a + x.weight, 0);
+      let r = Math.random() * total;
+
+      for (const x of weighted) {
+        r -= x.weight;
+        if (r <= 0) return x.id;
+      }
+
+      return weighted[weighted.length - 1].id;
+    }
+
+    function chooseMotif(previousId, position01) {
+      const total = Object.values(stats).reduce((a, s) => a + s.n, 0) + 1;
+      const bucket = position01 < 0.34 ? 0 : position01 < 0.68 ? 1 : 2;
+
+      const scored = MOTIFS.map((m) => {
+        const s = stats[m.id];
+
+        const mean = (s.sum + 0.55) / (s.n + 1);
+        const explore = 0.26 * Math.sqrt(Math.log(total + 1) / (s.n + 1));
+        const transition = previousId ? (TRANSITION_BONUS[previousId]?.[m.id] ?? 0) : 0;
+        const position = POSITION_BIAS[m.id]?.[bucket] ?? 0;
+
+        const recentCount = recentMotifs.filter((id) => id === m.id).length;
+
+        const repeatPenalty =
+          (m.id === previousId ? 0.62 : 0) +
+          recentCount * 0.13 +
+          (m.id === "suspend" ? 0.10 : 0);
+
+        return {
+          id: m.id,
+          score:
+            mean +
+            explore +
+            transition +
+            position -
+            repeatPenalty +
+            rand(-0.06, 0.06)
+        };
+      });
+
+      return sampleSoftmax(scored, Number(noveltyEl.value));
+    }
+
+    function markRecentMotifs(ids) {
+      recentMotifs.push(...ids);
+
+      while (recentMotifs.length > RECENT_LIMIT) {
+        recentMotifs.shift();
+      }
+    }
+
+    function chooseArc() {
+      return sampleSoftmax([
+        { id: "build", score: 0.34 + rand(0, 0.10) },
+        { id: "wave", score: 0.30 + rand(0, 0.10) },
+        { id: "contrast", score: 0.28 + rand(0, 0.14) },
+        { id: "scatter", score: 0.24 + rand(0, 0.18) },
+        { id: "broken", score: 0.20 + rand(0, 0.22) }
+      ], 0.30);
+    }
+
+    function phraseEnvelope(arc, p) {
+      p = clamp(p, 0, 1);
+
+      switch (arc) {
+        case "build":
+          return 0.46 + 0.54 * smooth01(p);
+
+        case "wave":
+          return 0.62 + 0.38 * Math.sin(Math.PI * p);
+
+        case "contrast":
+          if (p < 0.36) return 0.74 + 0.20 * smooth01(p / 0.36);
+          if (p < 0.54) return 0.42;
+          return 0.58 + 0.42 * smooth01((p - 0.54) / 0.46);
+
+        case "scatter":
+          return clamp(
+            0.78 + 0.22 * Math.sin(2 * Math.PI * (1.7 * p + 0.13)),
+            0.45,
+            1.00
+          );
+
+        case "broken":
+          if (p < 0.20) return 0.52 + 0.18 * smooth01(p / 0.20);
+          if (p < 0.38) return 0.90;
+          if (p < 0.50) return 0.36;
+          if (p < 0.74) return 0.68 + 0.22 * Math.sin(2 * Math.PI * 3.0 * p);
+          return 0.74 + 0.26 * smooth01((p - 0.74) / 0.26);
+
+        default:
+          return 1;
+      }
+    }
+
+    function edgeEnvelope(p, duration) {
+      const fade = clamp(0.18 / Math.max(duration, 0.5), 0.035, 0.16);
+
+      return Math.min(
+        smooth01(p / fade),
+        smooth01((1 - p) / fade)
+      );
+    }
+
+    function applyIntensityWindow(x) {
+      const { minDrive, maxDrive } = getIntensityBounds();
+
+      const sign = Math.sign(x);
+      const mag = Math.abs(x);
+
+      /*
+        ほぼゼロの値は停止として扱う。
+        これにより、断続パルスや停止混合モチーフの「間」は維持される。
+      */
+      const deadzone = 0.018;
+
+      if (sign === 0 || mag < deadzone) {
+        return 0;
+      }
+
+      /*
+        非ゼロ駆動時だけ、magを [最低強度, 上限強度] に再マッピングする。
+        slew limitが後段にあるため、最低強度への移行も急峻になりにくい。
+      */
+      const normalized = clamp((mag - deadzone) / (1 - deadzone), 0, 1);
+      const shaped = minDrive + (maxDrive - minDrive) * smooth01(normalized);
+
+      return clamp(sign * shaped, -1, 1);
+    }
+
+    function getPhraseDurationRange() {
+      const value = Number(phraseLengthEl.value);
+
+      if (value === 0) return [10, 22];
+      if (value === 2) return [22, 45];
+
+      return [16, 32];
+    }
+
+    function makeMotifItem(motif, start, duration, lastDir, position01) {
+      const dir = Math.random() < 0.58 ? -lastDir : lastDir;
+
+      const ampRange = {
+        breath: [0.35, 0.78],
+        stutter: [0.42, 0.92],
+        ratchet: [0.38, 0.94],
+        reverseSnap: [0.40, 0.88],
+        flutter: [0.34, 0.82],
+        drift: [0.30, 0.76],
+        holdDrop: [0.40, 0.92],
+        triplet: [0.42, 0.90],
+        suspend: [0.10, 0.28],
+        surge: [0.38, 0.96],
+        hesitate: [0.28, 0.78],
+        syncopate: [0.42, 0.92]
+      }[motif] ?? [0.30, 0.80];
+
+      let amp = rand(ampRange[0], ampRange[1]);
+
+      if (position01 < 0.20) amp *= 0.86;
+      if (position01 > 0.76 && motif !== "suspend") amp *= 1.05;
+
+      return {
+        motif,
+        start,
+        duration,
+        dir,
+        amp,
+
+        phase: rand(0, Math.PI * 2),
+        cycle: rand(0.34, 1.80),
+        duty: rand(0.28, 0.74),
+        steps: Math.floor(rand(3, 8)),
+        rate: rand(2.2, 7.5),
+        groupCycle: rand(0.72, 1.45),
+
+        thirdReverse: Math.random() < 0.55,
+        dropWidth: rand(0.10, 0.24),
+        midFlip: Math.random() < 0.42,
+
+        noise: rand(-0.25, 0.25),
+        noiseTarget: rand(-1, 1),
+        noiseStep: rand(0.18, 0.42),
+        noiseEase: rand(0.10, 0.24),
+        lastNoiseAt: -Infinity,
+
+        syncPattern: makeSyncPattern()
+      };
+    }
+
+    function makeSyncPattern() {
+      const base = [
+        { on: 0.13, off: 0.08, amp: 1.00 },
+        { on: 0.19, off: 0.12, amp: 0.66 },
+        { on: 0.10, off: 0.06, amp: 0.85 },
+        { on: 0.24, off: 0.18, amp: 0.52 }
+      ];
+
+      for (let i = base.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [base[i], base[j]] = [base[j], base[i]];
+      }
+
+      return base;
+    }
+
+    function createSegment(nowMs) {
+      const [minPhrase, maxPhrase] = getPhraseDurationRange();
+      const targetDuration = rand(minPhrase, maxPhrase);
+      const arc = chooseArc();
+      const items = [];
+
+      let t = 0;
+      let previousId = null;
+      let lastDir = Math.random() < 0.5 ? -1 : 1;
+      const maxItems = Number(phraseLengthEl.value) === 2 ? 14 : 10;
+
+      while (t < targetDuration && items.length < maxItems) {
+        const position01 = t / targetDuration;
+        const motif = chooseMotif(previousId, position01);
+        const meta = MOTIFS_BY_ID[motif];
+
+        const duration = Math.min(
+          rand(meta.minDur, meta.maxDur),
+          targetDuration - t
+        );
+
+        if (duration < 1.0 && items.length > 0) break;
+
+        const item = makeMotifItem(motif, t, duration, lastDir, position01);
+        items.push(item);
+
+        previousId = motif;
+        lastDir = item.dir;
+        t += duration;
+      }
+
+      currentSegment = {
+        mode: "phrase",
+        arc,
+        duration: t,
+        items
+      };
+
+      segmentStartMs = nowMs;
+      markRecentMotifs(items.map((x) => x.motif));
+
+      const labels = items.map((x) => MOTIFS_BY_ID[x.motif].label);
+      modeView.textContent = `${ARC_LABEL[arc]}: ${labels.join(" → ")}`;
+
+      log(`新規フレーズ: ${ARC_LABEL[arc]}, ${t.toFixed(1)}秒, ${labels.join(" / ")}`);
+    }
+
+    function activeItemForTime(seg, tSec) {
+      if (!seg?.items) return null;
+
+      return seg.items.find((item) =>
+        tSec >= item.start && tSec < item.start + item.duration
+      ) ?? null;
+    }
+
+    function valueForMotif(item, t, p) {
+      const amp = item.amp;
+      const dir = item.dir;
+
+      switch (item.motif) {
+        case "breath": {
+          const wave = 0.5 - 0.5 * Math.cos(2 * Math.PI * p);
+          const sign = p < 0.52 ? dir : -dir;
+
+          return sign * amp * (0.18 + 0.82 * smooth01(wave));
+        }
+
+        case "stutter": {
+          const f = (t / item.cycle) % 1;
+
+          if (f > item.duty) return 0;
+
+          const local = f / item.duty;
+          const accent = Math.floor(t / item.cycle) % 5 === 4 ? 0.55 : 1.0;
+
+          return dir * amp * accent * Math.sin(Math.PI * local);
+        }
+
+        case "ratchet": {
+          const stepFloat = p * item.steps;
+          const step = Math.floor(stepFloat);
+          const within = stepFloat - step;
+
+          if (within < 0.08) return 0;
+
+          const level = (step + smooth01(within)) / item.steps;
+          const sign = item.midFlip && p > 0.72 ? -dir : dir;
+
+          return sign * amp * (0.16 + 0.84 * level);
+        }
+
+        case "reverseSnap": {
+          const f = (t / item.cycle) % 1;
+
+          if (f < 0.10) return 0;
+
+          if (f < 0.28) {
+            return -dir * amp * (0.35 + 0.65 * smooth01((f - 0.10) / 0.18));
+          }
+
+          return dir * amp * (0.42 + 0.58 * smooth01((f - 0.28) / 0.72));
+        }
+
+        case "flutter": {
+          const sign =
+            Math.floor(t / Math.max(0.55, item.cycle)) % 2 === 0
+              ? dir
+              : -dir;
+
+          const mod =
+            0.34 +
+            0.66 * Math.abs(Math.sin(2 * Math.PI * item.rate * t + item.phase));
+
+          const wobble =
+            0.82 +
+            0.18 * Math.sin(2 * Math.PI * 0.37 * t + item.phase);
+
+          return sign * amp * mod * wobble;
+        }
+
+        case "drift": {
+          if (t - item.lastNoiseAt > item.noiseStep) {
+            item.noiseTarget = rand(-1, 1);
+            item.lastNoiseAt = t;
+          }
+
+          item.noise += (item.noiseTarget - item.noise) * item.noiseEase;
+
+          const z = Math.abs(item.noise) < 0.14 ? 0 : item.noise;
+
+          return amp * clamp(z, -1, 1);
+        }
+
+        case "holdDrop": {
+          const f = (t / item.cycle) % 1;
+
+          if (f < item.dropWidth) return 0;
+
+          const sign = item.midFlip && p > 0.58 ? -dir : dir;
+          const recover = smooth01((f - item.dropWidth) / (1 - item.dropWidth));
+
+          return sign * amp * (0.48 + 0.52 * recover);
+        }
+
+        case "triplet": {
+          const f = (t / item.groupCycle) % 1;
+
+          if (f > 0.72) return 0;
+
+          const local3 = (f / 0.72) * 3;
+          const pulseIndex = Math.floor(local3);
+          const within = local3 - pulseIndex;
+
+          const sign =
+            item.thirdReverse && pulseIndex === 2
+              ? -dir
+              : dir;
+
+          const accent = pulseIndex === 1 ? 0.72 : 1.0;
+
+          return sign * amp * accent * Math.sin(Math.PI * within);
+        }
+
+        case "suspend": {
+          const tiny = 0.35 + 0.65 * Math.sin(Math.PI * p);
+          return dir * amp * tiny;
+        }
+
+        case "surge": {
+          const attack = smooth01(clamp(p / 0.24, 0, 1));
+          const decay = 1 - 0.62 * smooth01(clamp((p - 0.24) / 0.76, 0, 1));
+
+          const flip =
+            p > 0.70 && Math.floor(t * 3.0) % 2 === 0
+              ? -dir
+              : dir;
+
+          return flip * amp * attack * decay;
+        }
+
+        case "hesitate": {
+          const f = (t / item.cycle) % 1;
+
+          if (f < 0.16) return 0;
+
+          const sign =
+            Math.floor(t / item.cycle) % 3 === 1
+              ? -dir
+              : dir;
+
+          const hesitation =
+            f < 0.42
+              ? 0.34 + 0.30 * smooth01((f - 0.16) / 0.26)
+              : 0.64 + 0.36 * smooth01((f - 0.42) / 0.58);
+
+          return sign * amp * hesitation;
+        }
+
+        case "syncopate": {
+          let cursor = 0;
+          const cycleLength = item.syncPattern.reduce((a, x) => a + x.on + x.off, 0);
+          const local = t % cycleLength;
+
+          for (let i = 0; i < item.syncPattern.length; i++) {
+            const part = item.syncPattern[i];
+
+            if (local >= cursor && local < cursor + part.on) {
+              const q = (local - cursor) / part.on;
+              const sign = i % 3 === 2 ? -dir : dir;
+
+              return sign * amp * part.amp * Math.sin(Math.PI * q);
+            }
+
+            cursor += part.on + part.off;
+          }
+
+          return 0;
+        }
+
+        default:
+          return 0;
+      }
+    }
+
+    function valueForSegment(seg, tSec, sessionElapsedMs) {
+      const item = activeItemForTime(seg, tSec);
+
+      if (!item) return 0;
+
+      const localT = tSec - item.start;
+      const localP = clamp(localT / item.duration, 0, 1);
+      const phraseP = clamp(tSec / seg.duration, 0, 1);
+
+      /*
+        開始直後から設定上限へ行かないようにする。
+        約2分かけて上限へ近づける。
+      */
+      const warm = clamp(
+        0.18 + 0.82 * (sessionElapsedMs / 120000),
+        0.18,
+        1.0
+      );
+
+      const phraseGain = phraseEnvelope(seg.arc, phraseP);
+      const edgeGain = edgeEnvelope(localP, item.duration);
+
+      /*
+        rawは強度スライダー適用前の正規化出力。
+        ここに最低強度・上限強度の窓を適用する。
+      */
+      const raw = clamp(
+        valueForMotif(item, localT, localP) *
+          warm *
+          phraseGain *
+          edgeGain,
+        -1,
+        1
+      );
+
+      return applyIntensityWindow(raw);
+    }
+
+    async function connect() {
+      try {
+        if (!window.isSecureContext) {
+          throw new Error("HTTPSまたはlocalhostで開いてください。");
+        }
+
+        if (!navigator.bluetooth) {
+          throw new Error("このブラウザはWeb Bluetoothに対応していません。Chromium系ブラウザで確認してください。");
+        }
+
+        setStatus("デバイス選択中...");
+
+        const options = ACCEPT_ALL_DEVICES
+          ? {
+              acceptAllDevices: true,
+              optionalServices: [SERVICE_UUID]
+            }
+          : {
+              filters: [{ services: [SERVICE_UUID] }],
+              optionalServices: [SERVICE_UUID]
+            };
+
+        device = await navigator.bluetooth.requestDevice(options);
+        device.addEventListener("gattserverdisconnected", handleDisconnected);
+
+        setStatus("接続中...");
+        server = await device.gatt.connect();
+
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        writeChar = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+        startBtn.disabled = false;
+        stopBtn.disabled = false;
+
+        setStatus(`接続済み: ${device.name || device.id}`);
+        log("BLE接続完了");
+      } catch (err) {
+        setStatus("接続失敗");
+        log(`接続エラー: ${err.message || err}`);
+      }
+    }
+
+    async function writeOneProtocolInt(n) {
+      if (!writeChar) return;
+
+      /*
+        出力 [-1, 1] を [-255, 255] に変換済みの整数として受け取り、
+        その10進文字列表現をUTF-8で送る。
+        例: -255, -128, 0, 127, 255
+      */
+      const text = `${n}${PROTOCOL_SUFFIX}`;
+      const data = encoder.encode(text);
+
+      if (writeChar.properties.writeWithoutResponse && writeChar.writeValueWithoutResponse) {
+        await writeChar.writeValueWithoutResponse(data);
+        return;
+      }
+
+      if (writeChar.properties.write && writeChar.writeValueWithResponse) {
+        await writeChar.writeValueWithResponse(data);
+        return;
+      }
+
+      /*
+        古い実装向けの後方互換。
+      */
+      if (writeChar.writeValue) {
+        await writeChar.writeValue(data);
+        return;
+      }
+
+      throw new Error("このcharacteristicはwriteに対応していません。");
+    }
+
+    function enqueueProtocolInt(n) {
+      pendingInt = clamp(Math.round(n), -255, 255);
+
+      if (!pumpPromise) {
+        pumpPromise = pumpWrites().catch((err) => {
+          log(`書き込みエラー: ${err.message || err}`);
+        });
+      }
+
+      return pumpPromise;
+    }
+
+    async function pumpWrites() {
+      try {
+        while (pendingInt !== null) {
+          const n = pendingInt;
+          pendingInt = null;
+          await writeOneProtocolInt(n);
+        }
+      } finally {
+        pumpPromise = null;
+
+        /*
+          finally中に新しい値が入った場合の取りこぼし防止。
+        */
+        if (pendingInt !== null) {
+          enqueueProtocolInt(pendingInt);
+        }
+      }
+    }
+
+    function setOutput(x, force = false) {
+      const safeX = clamp(x, -1, 1);
+      const protocolInt = protocolIntFromOutput(safeX);
+
+      outputView.textContent = `${safeX.toFixed(3)} → ${protocolInt}`;
+
+      if (!force && protocolInt === lastProtocolInt) {
+        return Promise.resolve();
+      }
+
+      lastProtocolInt = protocolInt;
+      return enqueueProtocolInt(protocolInt);
+    }
+
+    function tick() {
+      if (!running) return;
+
+      const now = performance.now();
+      const sessionElapsedMs = now - sessionStartMs;
+      const maxMs = Number(maxMinutesEl.value) * 60 * 1000;
+
+      if (sessionElapsedMs >= maxMs) {
+        void stop("最大連続実行時間に到達");
+        return;
+      }
+
+      if (!currentSegment || (now - segmentStartMs) / 1000 >= currentSegment.duration) {
+        createSegment(now);
+      }
+
+      const dtSec = clamp((now - lastTickMs) / 1000, 0.001, 0.25);
+      lastTickMs = now;
+
+      const tSec = (now - segmentStartMs) / 1000;
+      const target = valueForSegment(currentSegment, tSec, sessionElapsedMs);
+
+      /*
+        slew limit。
+        出力変化を抑え、急激な反転・急停止を緩和する。
+      */
+      const maxDelta = Number(slewEl.value) * dtSec;
+      lastOutput += clamp(target - lastOutput, -maxDelta, maxDelta);
+      lastOutput = clamp(lastOutput, -1, 1);
+
+      void setOutput(lastOutput);
+    }
+
+    function start() {
+      if (!writeChar) {
+        log("未接続");
+        return;
+      }
+
+      if (running) return;
+
+      running = true;
+      sessionStartMs = performance.now();
+      lastTickMs = sessionStartMs;
+      segmentStartMs = sessionStartMs;
+      currentSegment = null;
+      lastOutput = 0;
+      lastProtocolInt = null;
+
+      timerId = window.setInterval(tick, WRITE_INTERVAL_MS);
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      log("開始");
+    }
+
+    async function stop(reason = "停止") {
+      running = false;
+
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = 0;
+      }
+
+      currentSegment = null;
+      modeView.textContent = "なし";
+      lastOutput = 0;
+
+      await setOutput(0, true);
+
+      startBtn.disabled = !writeChar;
+      stopBtn.disabled = !writeChar;
+
+      log(reason);
+    }
+
+    async function emergencyStop(reason) {
+      await stop(reason || "緊急停止");
+    }
+
+    function handleDisconnected() {
+      running = false;
+
+      if (timerId) {
+        clearInterval(timerId);
+        timerId = 0;
+      }
+
+      writeChar = null;
+      server = null;
+      currentSegment = null;
+      modeView.textContent = "なし";
+
+      startBtn.disabled = true;
+      stopBtn.disabled = true;
+
+      setStatus("切断");
+      log("BLE切断。デバイス側にも通信タイムアウト時停止のwatchdogを実装してください。");
+    }
+
+    function applyFeedback(kind) {
+      if (!currentSegment?.items?.length) {
+        log("評価対象のフレーズなし");
+        return;
+      }
+
+      const rewardMap = {
+        good: 1.00,
+        ok: 0.62,
+        tooWeak: 0.44,
+        tooStrong: 0.08,
+        boring: 0.15
+      };
+
+      const reward = rewardMap[kind] ?? 0.5;
+      const elapsed = (performance.now() - segmentStartMs) / 1000;
+      const active = activeItemForTime(currentSegment, elapsed);
+
+      /*
+        フレーズ内の全モチーフを少し学習しつつ、
+        現在アクティブなモチーフを強めに更新する。
+      */
+      for (const item of currentSegment.items) {
+        const activeBoost = active === item ? 2.8 : 1.0;
+        const weight = activeBoost * item.duration / currentSegment.duration;
+        const s = stats[item.motif];
+
+        s.n += weight;
+        s.sum += reward * weight;
+      }
+
+      saveStats();
+
+      if (kind === "tooStrong") {
+        setIntensity(Number(intensityEl.value) * 0.82);
+        setMinIntensity(Number(minIntensityEl.value) * 0.72);
+
+        for (const item of currentSegment.items) {
+          if (item.start + item.duration >= elapsed) {
+            item.amp *= 0.38;
+          }
+        }
+
+        lastOutput *= 0.35;
+        void setOutput(lastOutput, true);
+
+        log("評価: 強い / 不快。上限強度と最低強度を下げ、以降の出力も下げました。");
+        return;
+      }
+
+      if (kind === "tooWeak") {
+        setIntensity(Number(intensityEl.value) * 1.07);
+
+        /*
+          最低強度が0より大きい場合だけ、わずかに底上げする。
+          0に設定している場合は、利用者の明示設定を尊重して0のまま。
+        */
+        if (Number(minIntensityEl.value) > 0) {
+          setMinIntensity(Number(minIntensityEl.value) * 1.04);
+        }
+
+        /*
+          弱いときは現在フレーズを少し早めに切り上げ、
+          次の探索へ移る。
+        */
+        currentSegment.duration = Math.min(
+          currentSegment.duration,
+          elapsed + 4
+        );
+
+        log("評価: 弱い。上限強度を少し上げ、最低強度も必要に応じてわずかに上げました。");
+        return;
+      }
+
+      if (kind === "boring") {
+        /*
+          単調と評価された現在モチーフを直近履歴へ重複追加し、
+          しばらく選ばれにくくする。
+        */
+        if (active) {
+          markRecentMotifs([
+            active.motif,
+            active.motif,
+            active.motif,
+            active.motif,
+            active.motif
+          ]);
+        }
+
+        currentSegment.duration = 0;
+
+        log("評価: 単調。直近モチーフを避けて次フレーズへ切り替えます。");
+        return;
+      }
+
+      const activeLabel = active
+        ? MOTIFS_BY_ID[active.motif].label
+        : "不明";
+
+      log(`評価: ${kind} / 現在モチーフ=${activeLabel} / reward=${reward.toFixed(2)}`);
+    }
+
+    connectBtn.addEventListener("click", connect);
+    startBtn.addEventListener("click", start);
+    stopBtn.addEventListener("click", () => void emergencyStop("手動停止"));
+    $("resetLearningBtn").addEventListener("click", resetLearning);
+
+    document.querySelectorAll("[data-feedback]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        applyFeedback(btn.dataset.feedback);
+      });
+    });
+
+    intensityEl.addEventListener("input", updateControls);
+    minIntensityEl.addEventListener("input", updateControls);
+    slewEl.addEventListener("input", updateControls);
+    maxMinutesEl.addEventListener("input", updateControls);
+    noveltyEl.addEventListener("input", updateControls);
+    phraseLengthEl.addEventListener("input", updateControls);
+
+    /*
+      安全側停止。
+      タブが非表示になった、ページを閉じる、スペースキー押下で停止。
+    */
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && running) {
+        void emergencyStop("タブ非表示のため停止");
+      }
+    });
+
+    window.addEventListener("pagehide", () => {
+      if (writeChar) {
+        void setOutput(0, true);
+      }
+    });
+
+    window.addEventListener("keydown", (ev) => {
+      if (ev.code === "Space") {
+        ev.preventDefault();
+        void emergencyStop("スペースキー停止");
+      }
+    });
+
+    updateControls();
+    log("準備完了。UUIDを実機に合わせてから接続してください。");
+  </script>
+</body>
+</html>
